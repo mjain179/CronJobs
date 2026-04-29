@@ -243,3 +243,5 @@ dmypy.json
 
 # RequestDocuments folder for faxing process
 python/RequestDocuments
+
+config.py
