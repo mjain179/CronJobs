@@ -151,6 +151,12 @@ def sendStuckInformedConsentEmail(recipient_email, recipient_name, html_table, n
         msg = MIMEMultipart()
         msg['From'] = 'service@motusnova.com'
         msg['To'] = recipient_email
+        cc_emails = [
+            "parth.patel@motusnova.com",
+            "divyesh.ved@motusnova.com",
+            "manav.jain@motusnova.com"
+        ]
+        msg['Cc'] = ", ".join(cc_emails)
         msg['Subject'] = f'{number_of_people} People stuck in Informed Consent'
 
         greeting_name = recipient_name if recipient_name else 'there'
@@ -162,12 +168,11 @@ def sendStuckInformedConsentEmail(recipient_email, recipient_name, html_table, n
             <p>Hi {greeting_name},</p>
             <p>The table below lists the patients <strong>assigned to you</strong> whose last
             <code>patientSuccessStory</code> status update is older than the threshold for that
-            status. The criteria column shows the age threshold (based on
-            <code>story_fresh.created_at</code>) used to flag each status.</p>
+            status. The criteria column shows the age threshold used to flag each status.</p>
             <p><strong>Total people stuck (assigned to you):</strong> {number_of_people}</p>
             {html_table}
             <p style="margin-top: 30px; color: #555; font-size: 12px;">
-                This is an automated report. If anything looks off, message Parth.
+                This is an automated report. If anything looks off, "Reply All" to this email.
             </p>
         </body>
         </html>
