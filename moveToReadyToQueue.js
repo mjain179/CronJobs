@@ -102,7 +102,6 @@ const getPatientsWithSignedTickets = async () => {
       ON sf_insurance.story_id = sf_newprofile.origin 
       AND sf_newprofile.type = 'newProfile'
     WHERE i.docuseal_submission_id IS NOT NULL
-    AND (i.delivery_ticket IS NULL OR i.delivery_ticket = '' OR i.delivery_ticket = 'NA')
     ORDER BY i.created_at DESC
   `;
   
