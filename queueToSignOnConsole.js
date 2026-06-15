@@ -53,7 +53,7 @@ const createPrefillInfo = (patientData) => {
   return {
     "$patient_name": patientData.name || '',
     "$account_number": '', // Not available in current data
-    "$patient_address": [patientData.street_address, patientData.second_street_address].filter(Boolean).join(', '),
+    "$patient_address": patientData.street_address || '',
     "$patient_city": patientData.city_address || '',
     "$patient_state": patientData.state || '',
     "$patient_zip_code": patientData.zip_code || '',
@@ -128,7 +128,6 @@ const getPatientDeliveryData = async (contactId, insuranceId = null) => {
     c.email,
     c.phone_number,
     c.street_address,
-    c.second_street_address,
     c.city_address,
     c.state,
     c.zip_code,
