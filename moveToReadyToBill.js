@@ -43,7 +43,8 @@ const getPatientsToCheck = async () => {
     AND t.status = 'DELIVERED'
     AND s.status = 'deliveryTicket'
     AND (
-      i.delivery_ticket IN ('IME', 'ROM')
+      UPPER(TRIM(i.delivery_ticket)) IN ('IME', 'ROM')
+      OR LOWER(TRIM(i.delivery_ticket)) IN ('bestcare', 'kesslick', 'statewide')
       OR i.docuseal_submission_id IS NOT NULL
     )
     ORDER BY t.created_at DESC
@@ -145,15 +146,18 @@ const checkSignedDeliveryTickets = async () => {
         console.log(`   Tracking Status: ${patient.tracking_status}`);
         console.log(`   Story Status: ${patient.story_status || 'Not set'}`);
 
-        // IMED and ROM tickets don't require DocuSeal signature — move directly to readyToBill
-      if (['IME', 'ROM'].includes(patient.delivery_ticket)) {
-        console.log(`   ⚡ Delivery ticket type ${patient.delivery_ticket} does not require DocuSeal — auto-advancing...`);
-        await updateStoryFreshStatus(patient.insurance_id, 'readyToBill');
-        await insertIntoStoryTable(patient.insurance_id, 'readyToBill');
-        console.log(`   ✅ Successfully moved to readyToBill status\n`);
-        movedToReadyToBill++;
-        continue;
-      }
+        // Ticket types that don't require a DocuSeal signature
+        const NO_DOCUSEAL_TICKETS = ['ime', 'rom', 'bestcare', 'kesslick', 'statewide'];
+        const deliveryTicketValue = (patient.delivery_ticket || '').toLowerCase().trim();
+
+        if (NO_DOCUSEAL_TICKETS.includes(deliveryTicketValue)) {
+          console.log(`   ⚡ Delivery ticket type '${patient.delivery_ticket}' does not require DocuSeal — auto-advancing...`);
+          await updateStoryFreshStatus(patient.insurance_id, 'readyToBill');
+          await insertIntoStoryTable(patient.insurance_id, 'readyToBill');
+          console.log(`   ✅ Successfully moved to readyToBill status\n`);
+          movedToReadyToBill++;
+          continue;
+        }
         
         // Check if the delivery ticket has been signed
         const submissionStatus = await checkDocusealSubmissionStatus(patient.docuseal_submission_id);

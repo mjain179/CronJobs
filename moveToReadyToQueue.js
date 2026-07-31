@@ -101,7 +101,10 @@ const getPatientsWithSignedTickets = async () => {
     JOIN story_fresh sf_newprofile 
       ON sf_insurance.story_id = sf_newprofile.origin 
       AND sf_newprofile.type = 'newProfile'
-    WHERE i.docuseal_submission_id IS NOT NULL
+    WHERE (
+      i.docuseal_submission_id IS NOT NULL
+      OR LOWER(TRIM(i.delivery_ticket)) IN ('bestcare', 'kesslick', 'statewide')
+    )
     ORDER BY i.created_at DESC
   `;
   
@@ -250,6 +253,29 @@ const processDMESignedDeliveryTickets = async () => {
         }
         
         console.log(`   ✅ Found patientSuccessStory with status 'waitingForSignedPatientPacket'`);
+        
+        // If delivery_ticket is already one of these manual values, skip DocuSeal check
+        const manualDeliveryTickets = ['bestcare', 'kesslick', 'statewide'];
+        const deliveryTicketValue = (patient.delivery_ticket || '').toLowerCase().trim();
+        
+        if (manualDeliveryTickets.includes(deliveryTicketValue)) {
+          console.log(`   ⏭️  delivery_ticket is '${patient.delivery_ticket}' - skipping DocuSeal check`);
+          processedCount++;
+          
+          console.log(`   📝 Updating patientSuccessStory status to readyToQueue...`);
+          const storyUpdatedManual = await updatePatientSuccessStoryStatus(patient.profile_id);
+          
+          if (storyUpdatedManual) {
+            await insertPatientSuccessStoryToMainTable(patient.profile_id);
+            console.log(`   ✅ patientSuccessStory status updated to readyToQueue`);
+            successStoryUpdatedCount++;
+          } else {
+            console.log(`   ⚠️  No patientSuccessStory found for this profile`);
+          }
+          
+          console.log('');
+          continue;
+        }
         
         // Check Docuseal submission status
         const submissionStatus = await checkDocusealSubmissionStatus(patient.docuseal_submission_id);
