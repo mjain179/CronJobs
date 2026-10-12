@@ -18,6 +18,10 @@
  *                       -> proof_of_delivery
  *                       -> delivery_date
  *
+ * Both tracking_fresh and tracking also carry `order_id`, the shipment order
+ * this row fulfils. It is read from tracking_fresh and carried into every
+ * tracking log row like the other snapshot columns.
+ *
  * Which tracking number the id belongs to depends on how the row was last
  * written. The label creators set it alongside an OUTBOUND tracking number on
  * an initial or replacement shipment, and alongside a RETURN tracking number on
@@ -72,6 +76,29 @@
  *     the queue and NOTHING is written to either table
  *   - only an actual change writes to tracking_fresh + tracking
  *
+ * ORDER FULFILLMENT
+ * -----------------
+ * When the status moves off a pre-pickup status (created / initial / "Shipper
+ * created a label, UPS has not received the package yet") and onto one that
+ * means the parcel is actually moving (transit / delivered / on the way /
+ * departed / arrived at facility), the order is marked fulfilled by POSTing
+ * { order_id, timestamp } to FULFILL_ORDER_URL, where order_id comes from
+ * tracking_fresh and timestamp is the current time. Both lists are matched
+ * case-insensitively, as substrings, so carrier wording like "In Transit" or
+ * "Departed from Facility" still counts.
+ *
+ * The call is made INSIDE the write transaction, as the last step before
+ * COMMIT, with order_id read under the row lock. If the call fails, the whole
+ * status write rolls back, so the row still shows its old status and the
+ * change — and with it the fulfillment — is retried on the next pass or run.
+ * Without that, a failed call would leave the status already written, the next
+ * run would see "unchanged", and the order would never be fulfilled.
+ *
+ * Failures follow the same classification as Shippiz lookups (transient ->
+ * retried this run, anything else -> next run). A row that reaches this status
+ * with no order_id is NOT an error: the status is written as usual and
+ * fulfillment is skipped (logged and counted, never emailed).
+ *
  * PROOF OF DELIVERY
  * -----------------
  * When the new status reads "delivered", the UPS POD is fetched, rendered to
@@ -100,7 +127,7 @@
  *
  * Flags:
  *   --dry-run               fetch and report, write nothing, send no email,
- *                           touch no state on disk
+ *                           call no fulfillment endpoint, touch no state on disk
  *   --limit=N               only queue the N most recent tracking_fresh rows
  *   --fresh                 ignore any leftover CSV from an interrupted run
  *   --include-quarantined   also queue shipments that have been quarantined
@@ -133,6 +160,25 @@ const GDRIVE_CREDENTIALS_PATH = path.join(__dirname, "credentials_manav.json");
 const GDRIVE_POD_FOLDER_ID = process.env.GDRIVE_POD_FOLDER_ID;
 const UPS_TOKEN_URL = "https://wwwcie.ups.com/security/v1/oauth/token";
 const UPS_TRACK_URL = "https://onlinetools.ups.com/api/track/v1/details";
+
+// --- order fulfillment ---
+const FULFILL_ORDER_URL = "https://two.motusnova.com/postal/shipmentOrders/fulfillOrder";
+// The order is fulfilled on the first transition OUT of a pre-pickup status
+// and INTO a status that means the parcel is moving. Both lists are matched
+// case-insensitively as substrings, so carrier wording ("In Transit",
+// "Departed from Facility") still matches.
+const PRE_FULFILL_STATUSES = [
+    "created",
+    "initial",
+    "shipper created a label, ups has not received the package yet",,
+    "on_the_way"
+];
+const FULFILL_UPDATED_STATUSES = [
+    "transit",
+    "delivered",
+    "departed",
+    "arrived at facility",
+];
 
 const MAX_PASSES = 3;                  // retries of the whole queue, within one run
 const MAX_FAILED_RUNS = 6;             // consecutive failed runs before quarantine
@@ -177,6 +223,7 @@ const SNAPSHOT_COLUMNS = [
     "console_tracking_number",
     "return_tracking_number",
     "shippiz_shipment_id",
+    "order_id",
     "proof_of_delivery",
     "delivery_date",
     "status",
@@ -184,7 +231,7 @@ const SNAPSHOT_COLUMNS = [
 
 const CSV_HEADERS = [
     "tracking_id", "contact_id", "profile_id", "patient_name", "leg", "shipment_id",
-    "tracking_number", "tracking_column", "current_status", "has_pod",
+    "order_id", "tracking_number", "tracking_column", "current_status", "has_pod",
     "attempts", "last_error",
 ];
 
@@ -229,6 +276,38 @@ function isTerminal(status) {
     if (!status) return false;
     const s = String(status).trim().toLowerCase();
     return TERMINAL_STATUSES.some((t) => s.includes(t));
+}
+
+/** Case-insensitive substring match of a status against a list of phrases. */
+function statusMatchesAny(status, phrases) {
+    if (status === null || status === undefined) return false;
+    const s = String(status).trim().toLowerCase();
+    if (!s) return false;
+    return phrases.some((p) => s.includes(p));
+}
+
+/** A label exists but the carrier has not picked the parcel up yet. */
+function isPreFulfillStatus(status) {
+    return statusMatchesAny(status, PRE_FULFILL_STATUSES);
+}
+
+/** The parcel is moving (or has arrived). */
+function isFulfillUpdatedStatus(status) {
+    return statusMatchesAny(status, FULFILL_UPDATED_STATUSES);
+}
+
+/**
+ * Should a transition from `fromStatus` to `toStatus` fulfil the order?
+ * Only the first move off a pre-pickup status and onto a moving status counts,
+ * so later transitions between moving statuses (transit -> delivered) do not
+ * fire it again.
+ */
+function shouldFulfill(fromStatus, toStatus) {
+    return isPreFulfillStatus(fromStatus) && isFulfillUpdatedStatus(toStatus);
+}
+
+function hasValue(v) {
+    return v !== null && v !== undefined && String(v).trim() !== "";
 }
 
 /** Stable identity for one tracked shipment, used to key the state file. */
@@ -426,11 +505,7 @@ async function fetchTrackingStatus(shipment_id) {
         const body = res.data || {};
         const shipment = body.shipmentAfterUpdate || body.shipment || body;
         const tracking = shipment?.trackingStatus?.status;
-        const overall = shipment?.status;
-
-        // trackingStatus.status can be an empty string on shipments the carrier
-        // hasn't reported on yet; the live state lives on the top-level `status`.
-        const status = (tracking && String(tracking).trim()) || (overall && String(overall).trim()) || null;
+        const status = (tracking && String(tracking).trim()) || null;
 
         if (!status) {
             return { noTrackingData: true };
@@ -451,6 +526,44 @@ async function fetchTrackingStatus(shipment_id) {
     }
 }
 
+// -------------------------------------------------------- order fulfillment
+
+/** An Error the caller should not retry within this run. */
+function permanentError(message) {
+    const err = new Error(message);
+    err.permanent = true;
+    return err;
+}
+
+/**
+ * POST { order_id, timestamp } to the fulfillOrder endpoint.
+ *
+ * Throws on failure, with `err.permanent` set when retrying inside this run
+ * cannot help (same classification as Shippiz lookups). Called from inside the
+ * write transaction, so a throw rolls the status change back.
+ */
+async function fulfillOrder(order_id) {
+    const timestamp = new Date().toISOString();
+    try {
+        const res = await axios.post(
+            FULFILL_ORDER_URL,
+            { order_id, timestamp },
+            {
+                headers: { "Content-Type": "application/json" },
+                timeout: REQUEST_TIMEOUT_MS,
+            }
+        );
+        return { timestamp, httpStatus: res.status };
+    } catch (err) {
+        const code = err.response?.status;
+        const detail = err.response?.data
+            ? JSON.stringify(err.response.data).slice(0, 200)
+            : (err.code || err.message);
+        const wrapped = new Error(`fulfillOrder HTTP ${code || "?"}: ${detail}`);
+        wrapped.permanent = !isTransientHttpStatus(code);
+        throw wrapped;
+    }
+}
 
 // --------------------------------------------------------- proof of delivery
 
@@ -674,6 +787,7 @@ async function buildQueueFromDB() {
             patient_name: row.patient_name ?? "",
             leg: SHIPMENT.name,
             shipment_id: row[SHIPMENT.idColumn],
+            order_id: row.order_id ?? "",
             tracking_number: trackingNumber,
             tracking_column: column,
             current_status: row[SHIPMENT.statusColumn] ?? "",
@@ -698,9 +812,19 @@ async function buildQueueFromDB() {
  * and only while its delivered_date and proof_of_delivery are both still empty
  * — the same guard the label creators use, so a return delivery can never
  * overwrite the initial shipment's POD.
+ *
+ * When the status moves off a pre-pickup status and onto a moving one, the
+ * order is fulfilled via FULFILL_ORDER_URL as the final step before COMMIT. A
+ * failure there rolls the whole write back so the change is retried rather
+ * than lost. If the row has no order_id, fulfillment is skipped (not an error)
+ * and the status is written as usual.
+ *
+ * Returns { fulfilled: boolean, fulfillSkipped: boolean }.
  */
 async function writeLegStatus(item, newStatus, podLink = null) {
     const leg = SHIPMENT;
+    let fulfilled = false;
+    let fulfillSkipped = false;
 
     const client = await pool.connect();
     try {
@@ -713,6 +837,15 @@ async function writeLegStatus(item, newStatus, podLink = null) {
         )).rows[0];
 
         if (!current) throw new Error(`tracking_id ${item.tracking_id} no longer exists`);
+
+        // Decide on fulfillment up front, from the status under the row lock.
+        // No order_id is not an error: the status is still written and
+        // fulfillment is skipped.
+        const needsFulfill = shouldFulfill(current[leg.statusColumn], newStatus);
+        if (needsFulfill && !hasValue(current.order_id)) {
+            fulfillSkipped = true;
+            log(`    no order_id on tracking_fresh — status written, fulfillment skipped`);
+        }
 
         // One timestamp for the whole transaction, so tracking_fresh, the
         // tracking log row and insurance_fresh all record the same instant.
@@ -806,6 +939,8 @@ async function writeLegStatus(item, newStatus, podLink = null) {
             log(`    tracked number was a return (${item.tracking_column || "unknown"}) — insurance_fresh left untouched`);
         }
 
+        // order_id is in SNAPSHOT_COLUMNS, so it is copied from tracking_fresh
+        // into the tracking log row along with everything else.
         const merged = { ...current, [leg.statusColumn]: newStatus };
         if (podLink && !trackingAlreadyStamped) {
             merged[leg.podColumn] = podLink;
@@ -827,9 +962,25 @@ async function writeLegStatus(item, newStatus, podLink = null) {
             insertValues
         );
 
+        // Fulfil the order LAST, after every SQL statement has succeeded, so the
+        // only thing that can still fail after a successful call is COMMIT. If
+        // the call itself fails, the throw rolls everything above back and the
+        // status change is retried next pass/run.
+        if (needsFulfill && !fulfillSkipped) {
+            const { timestamp, httpStatus } = await fulfillOrder(current.order_id);
+            fulfilled = true;
+            log(`    order ${current.order_id} fulfilled (HTTP ${httpStatus}, timestamp ${timestamp})`);
+        }
+
         await client.query("COMMIT");
+        return { fulfilled, fulfillSkipped };
     } catch (err) {
         await client.query("ROLLBACK").catch(() => {});
+        if (fulfilled) {
+            // The endpoint accepted the order but the status did not commit.
+            // The next attempt will call it again — make that visible.
+            log(`    WARNING: order ${item.order_id} was fulfilled but the status write rolled back — it will be re-sent on retry`);
+        }
         throw err;
     } finally {
         client.release();
@@ -866,7 +1017,7 @@ async function emailFailureReport(items, reportPath, quarantinedTotal) {
     const shown = items.slice(0, 25);
     const rowsHtml = shown.map((it) =>
         `<tr><td>${it.tracking_id}</td><td>${it.leg}</td><td>${it.shipment_id}</td>` +
-        `<td>${it.attempts}</td><td>${it.failed_runs}</td>` +
+        `<td>${it.order_id}</td><td>${it.attempts}</td><td>${it.failed_runs}</td>` +
         `<td>${it.disposition}</td><td>${it.last_error}</td></tr>`
     ).join("");
 
@@ -878,7 +1029,7 @@ async function emailFailureReport(items, reportPath, quarantinedTotal) {
       The full report is attached as CSV. First ${shown.length} shown below:
       <br /><br />
       <table border="1" cellpadding="4" cellspacing="0">
-        <tr><th>tracking_id</th><th>leg</th><th>shipment_id</th><th>attempts</th>
+        <tr><th>tracking_id</th><th>leg</th><th>shipment_id</th><th>order_id</th><th>attempts</th>
             <th>failed_runs</th><th>disposition</th><th>last_error</th></tr>
         ${rowsHtml}
       </table>
@@ -974,6 +1125,13 @@ async function runPass(queue, passNumber, counts, permanent) {
         counts.changes.push({ label: describeItem(item), transition });
 
         if (DRY_RUN) {
+            if (shouldFulfill(item.current_status, result.status)) {
+                if (hasValue(item.order_id)) {
+                    log(`    DRY RUN — would call fulfillOrder for order ${item.order_id}`);
+                } else {
+                    log(`    DRY RUN — no order_id, would write status and skip fulfillment`);
+                }
+            }
             if (isTerminal(result.status)) {
                 if (item.has_pod) {
                     log(`    DRY RUN — already has a POD, would skip the POD fetch`);
@@ -1022,13 +1180,21 @@ async function runPass(queue, passNumber, counts, permanent) {
         }
 
         try {
-            await writeLegStatus(item, result.status, podLink);
+            const { fulfilled, fulfillSkipped } = await writeLegStatus(item, result.status, podLink);
+            if (fulfilled) counts.fulfilled++;
+            if (fulfillSkipped) counts.fulfillSkipped++;
             counts.changed++;
             writeQueue([...remaining, ...queue.slice(i + 1)]);
         } catch (err) {
-            item.last_error = `db write: ${err.message}`;
-            log(`  write failed for ${describeItem(item)}: ${err}`);
-            remaining.push(item);
+            item.last_error = `write: ${err.message}`;
+            if (err.permanent) {
+                counts.permanent++;
+                log(`  write failed for ${describeItem(item)}: ${err.message} (permanent — not retried this run)`);
+                permanent.push(item);
+            } else {
+                log(`  write failed for ${describeItem(item)}: ${err}`);
+                remaining.push(item);
+            }
             writeQueue([...remaining, ...queue.slice(i + 1)]);
         }
     }
@@ -1086,7 +1252,7 @@ async function main() {
         return;
     }
 
-    log(`Shippiz tracking sync starting${DRY_RUN ? " (DRY RUN — no writes, no email, no state changes)" : ""}`);
+    log(`Shippiz tracking sync starting${DRY_RUN ? " (DRY RUN — no writes, no email, no fulfillment calls, no state changes)" : ""}`);
 
     if (RESET_STATE) {
         clearState();
@@ -1150,7 +1316,10 @@ async function main() {
     // the queue array — updateState needs them to expire stale records.
     const attemptedKeys = new Set(queue.map(legKey));
 
-    const counts = { apiCalls: 0, changed: 0, unchanged: 0, noData: 0, pods: 0, podSkipped: 0, permanent: 0, changes: [] };
+    const counts = {
+        apiCalls: 0, changed: 0, unchanged: 0, noData: 0, pods: 0, podSkipped: 0,
+        fulfilled: 0, fulfillSkipped: 0, permanent: 0, changes: [],
+    };
     const permanent = [];
 
     for (let pass = 1; pass <= MAX_PASSES && queue.length > 0; pass++) {
@@ -1177,6 +1346,7 @@ async function main() {
     log(
         `Done. api_calls=${counts.apiCalls} changed=${counts.changed} ` +
         `pods=${counts.pods} pods_skipped=${counts.podSkipped} ` +
+        `orders_fulfilled=${counts.fulfilled} fulfill_skipped_no_order=${counts.fulfillSkipped} ` +
         `unchanged=${counts.unchanged} no_tracking_data=${counts.noData} ` +
         `permanent_errors=${counts.permanent} unresolved=${unresolved.length}`
     );
